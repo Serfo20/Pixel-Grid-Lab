@@ -103,6 +103,21 @@ const TILE = {
 }
 const getTilePalette = () => themeModeRef.current === "dark" ? TILE.dark : TILE.light
 
+const hexToRgb = (h: number) => ({ r: (h >> 16) & 255, g: (h >> 8) & 255, b: h & 255 })
+
+const mix = (c1: number, c2: number, t: number) => {
+  const tt = Math.max(0, Math.min(1, t)) // yo: por si acaso
+  const A = hexToRgb(c1), B = hexToRgb(c2)
+  const r  = Math.round(A.r + (B.r - A.r) * tt)
+  const g  = Math.round(A.g + (B.g - A.g) * tt)
+  const bl = Math.round(A.b + (B.b - A.b) * tt) // azul
+  return `rgb(${r},${g},${bl})`
+}
+
+// ancho de fade entre paletas (fracción del tile)
+const PALETTE_FADE = 0.28   // yo: 28% del tile
+
+
 export default function PixiGrid() {
   const containerRef = useRef<HTMLDivElement>(null)
   const appRef = useRef<Application | null>(null)
@@ -406,9 +421,17 @@ export default function PixiGrid() {
     const app = appRef.current
     if (!app) return
 
-    const vis0 = getVisibleKeys()        // centro + adyacentes
-    const fogClear = vis0  
-    const ring1 = new Set([...fogClear].filter(k => !vis0.has(k))) // “anillo” entre visibles y fog real
+    const vis0 = getVisibleKeys()
+    const fogClear = vis0
+    // yo: anillo = celdas NO visibles que tocan vis0
+    const ring = new Set<string>()
+    vis0.forEach(key=>{
+      const [r,c]=key.split(":").map(Number)
+      ;[[r,c-1],[r,c+1],[r-1,c],[r+1,c]].forEach(([nr,nc])=>{
+        const k=`${nr}:${nc}`
+        if(!vis0.has(k)) ring.add(k)
+      })
+    })
 
     const theme = getTheme()
     const w = app.renderer.width, h = app.renderer.height
@@ -457,79 +480,55 @@ export default function PixiGrid() {
     //   app.stage.addChild(visBG)
     // }
 
-    // 1.5) Overlay de transición (anillo): sombreado con degradado orgánico hacia afuera
-    // if (ringCtxRef.current && ringSpriteRef.current && ringTexRef.current) {
-    //   const ctx = ringCtxRef.current
-    //   const shadeAlpha = themeModeRef.current === "dark" ? SHADE_ALPHA_DARK : SHADE_ALPHA_LIGHT
-    //   const fadeFrac = RING_FADE
+    /* 1) Transición de color near→far en el anillo */
+    if (ringCtxRef.current && ringSpriteRef.current && ringTexRef.current) {
+      const ctx = ringCtxRef.current
+      const cols = getTilePalette()
+      const fadeFrac = PALETTE_FADE
 
-    //   // reset canvas
-    //   if (ringCanvasRef.current && (ringCanvasRef.current.width !== w || ringCanvasRef.current.height !== h)) {
-    //     ringCanvasRef.current.width = w
-    //     ringCanvasRef.current.height = h
-    //   }
-    //   ctx.clearRect(0, 0, w, h)
+      // reset
+      if (ringCanvasRef.current && (ringCanvasRef.current.width!==w || ringCanvasRef.current.height!==h)) {
+        ringCanvasRef.current.width = w
+        ringCanvasRef.current.height = h
+      }
+      ctx.clearRect(0,0,w,h)
+      ctx.globalCompositeOperation = "source-over"
 
-    //   ring1.forEach(key => {
-    //     const [r, c] = key.split(":").map(Number)
-    //     const x = c * size - ox, y = r * size - oy
+      ring.forEach(key=>{
+        const [r,c]=key.split(":").map(Number)
+        const x=c*size-ox, y=r*size-oy
+        const sides:[("L"|"R"|"U"|"D"),number,number][] = [
+          ["L",r,c-1],["R",r,c+1],["U",r-1,c],["D",r+1,c],
+        ]
+        sides.forEach(([dir,nr,nc],i)=>{
+          if(!vis0.has(`${nr}:${nc}`)) return
+          // ancho con pequeña variación para romper líneas rectas
+          const v = 0.9 + 0.2*rand01(r,c,123+i)
+          const fade = fadeFrac*size*v
 
-    //     // Sombreado base de toda la celda
-    //     ctx.globalCompositeOperation = "source-over"
-    //     ctx.fillStyle = `rgba(0,0,0,${shadeAlpha})`
-    //     ctx.fillRect(x, y, size, size)
+          // gradiente de near→far
+          let grad:CanvasGradient
+          if(dir==="L") grad = ctx.createLinearGradient(x,0,x+fade,0)
+          else if(dir==="R") grad = ctx.createLinearGradient(x+size,0,x+size-fade,0)
+          else if(dir==="U") grad = ctx.createLinearGradient(0,y,0,y+fade)
+          else               grad = ctx.createLinearGradient(0,y+size,0,y+size-fade)
 
-    //     // Borrar (fade) hacia las celdas vis0 vecinas
-    //     ctx.globalCompositeOperation = "destination-out"
-    //     const sides: Array<["L"|"R"|"U"|"D", number, number]> = [
-    //       ["L", r, c - 1],
-    //       ["R", r, c + 1],
-    //       ["U", r - 1, c],
-    //       ["D", r + 1, c],
-    //     ]
-    //     sides.forEach(([dir, nr, nc], i) => {
-    //       if (!vis0.has(`${nr}:${nc}`)) return
-    //       const v = rand01(r, c, 900 + i)
-    //       const fade = fadeFrac * size * (0.85 + 0.3 * v) // ancho variable
+          grad.addColorStop(0, mix(cols.near, cols.far, 0.0))
+          grad.addColorStop(1, mix(cols.near, cols.far, 1.0))
+          ctx.fillStyle = grad
 
-    //       const grad =
-    //         dir === "L" ? ctx.createLinearGradient(x, 0, x + fade, 0) :
-    //         dir === "R" ? ctx.createLinearGradient(x + size, 0, x + size - fade, 0) :
-    //         dir === "U" ? ctx.createLinearGradient(0, y, 0, y + fade) :
-    //                       ctx.createLinearGradient(0, y + size, 0, y + size - fade)
+          if(dir==="L") ctx.fillRect(x, y, fade, size)
+          if(dir==="R") ctx.fillRect(x+size-fade, y, fade, size)
+          if(dir==="U") ctx.fillRect(x, y, size, fade)
+          if(dir==="D") ctx.fillRect(x, y+size-fade, size, fade)
+        })
+      })
 
-    //       // borrar más cerca del borde interior
-    //       grad.addColorStop(0, `rgba(0,0,0,${shadeAlpha})`)
-    //       grad.addColorStop(1, `rgba(0,0,0,0)`)
-    //       ctx.fillStyle = grad
-
-    //       if (dir === "L") ctx.fillRect(x, y, fade, size)
-    //       if (dir === "R") ctx.fillRect(x + size - fade, y, fade, size)
-    //       if (dir === "U") ctx.fillRect(x, y, size, fade)
-    //       if (dir === "D") ctx.fillRect(x, y + size - fade, size, fade)
-
-    //       // blobs que muerden el borde del fade (orgánico)
-    //       for (let b = 0; b < RING_BLOBS; b++) {
-    //         const u = rand01(r + b * 3, c + i * 5, 777)
-    //         const wv = rand01(r + b * 7, c + i * 11, 999)
-    //         const rad = (RING_BLOB_R_MIN + (RING_BLOB_R_MAX - RING_BLOB_R_MIN) * wv) * size
-    //         let cx = x, cy = y
-    //         if (dir === "L") { cx = x + fade * (0.4 + 0.5 * wv); cy = y + u * size }
-    //         if (dir === "R") { cx = x + size - fade * (0.4 + 0.5 * wv); cy = y + u * size }
-    //         if (dir === "U") { cx = x + u * size; cy = y + fade * (0.4 + 0.5 * wv) }
-    //         if (dir === "D") { cx = x + u * size; cy = y + size - fade * (0.4 + 0.5 * wv) }
-    //         ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fill()
-    //       }
-    //     })
-
-    //     ctx.globalCompositeOperation = "source-over"
-    //   })
-
-    //   ;(ringTexRef.current as any).source?.update?.()
-    //   ringSpriteRef.current.x = 0
-    //   ringSpriteRef.current.y = 0
-    //   app.stage.addChild(ringSpriteRef.current)
-    // }
+      ;(ringTexRef.current as any).source?.update?.()
+      ringSpriteRef.current.x=0
+      ringSpriteRef.current.y=0
+      app.stage.addChild(ringSpriteRef.current)
+    }
 
     // 2) Grilla
     const grid = new Graphics()
@@ -584,45 +583,54 @@ export default function PixiGrid() {
       // abro claros SOLO en vis0, con feather
       ctx.globalCompositeOperation = "destination-out"
 
-      // yo: muerdo 2px hacia adentro para que no quede halo claro en el borde
-      const holePad = -2
+      // abro claros SOLO en vis0, con feather y un pequeño retroceso
+      const holePadPx = -Math.round(size*0.04) // ~4% del tile hacia afuera
       ctx.filter = `blur(${FOG_FEATHER}px)`
-      const s2 = size - holePad * 2
-      vis0.forEach(key => {
-        const [r, c] = key.split(":").map(Number)
-        const x = c * size - ox + holePad
-        const y = r * size - oy + holePad
-        ctx.fillRect(x, y, s2, s2)
+      const s2 = size - holePadPx*2
+      vis0.forEach(key=>{
+        const [r,c]=key.split(":").map(Number)
+        const x=c*size-ox+holePadPx
+        const y=r*size-oy+holePadPx
+        ctx.fillRect(x,y,s2,s2)
       })
       ctx.filter = "none"
 
-      // mordidas orgánicas SOLO hacia afuera (vecino NO visible)
+      // borde orgánico sin círculos (tiritas con ruido) SOLO hacia afuera
       ctx.globalAlpha = FOG_CREEP_ALPHA
-      vis0.forEach(key => {
-        const [r, c] = key.split(":").map(Number)
-        const x = c * size - ox, y = r * size - oy
-        const sides: Array<["L"|"R"|"U"|"D", number, number]> = [
-          ["L", r, c - 1], ["R", r, c + 1], ["U", r - 1, c], ["D", r + 1, c],
-        ]
-        sides.forEach(([dir, nr, nc], i) => {
-          if (vis0.has(`${nr}:${nc}`)) return
-          const t = rand01(r, c, 101 + i)
-          const creep = (FOG_CREEP_MIN + (FOG_CREEP_MAX - FOG_CREEP_MIN) * t) * size
-          if (dir === "L") ctx.fillRect(x, y, creep, size)
-          if (dir === "R") ctx.fillRect(x + size - creep, y, creep, size)
-          if (dir === "U") ctx.fillRect(x, y, size, creep)
-          if (dir === "D") ctx.fillRect(x, y + size - creep, size, creep)
+      const SEG = 14  // cantidad de segmentos por lado
+      ring.forEach(key=>{
+        // solo trabajamos alrededor de celdas que NO son visibles pero tocan vis0
+        const [r,c]=key.split(":").map(Number)
+        const x=c*size-ox, y=r*size-oy
 
-          for (let b = 0; b < FOG_CREEP_BLOBS; b++) {
-            const u = rand01(r + b * 3, c + i * 5, 777)
-            const v = rand01(r + b * 7, c + i * 11, 999)
-            const rad = (FOG_CREEP_BLOB_R_MIN + (FOG_CREEP_BLOB_R_MAX - FOG_CREEP_BLOB_R_MIN) * v) * size
-            let cx = x, cy = y
-            if (dir === "L") { cx = x + creep * (0.55 + 0.35 * v); cy = y + u * size }
-            if (dir === "R") { cx = x + size - creep * (0.55 + 0.35 * v); cy = y + u * size }
-            if (dir === "U") { cx = x + u * size; cy = y + creep * (0.55 + 0.35 * v) }
-            if (dir === "D") { cx = x + u * size; cy = y + size - creep * (0.55 + 0.35 * v) }
-            ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fill()
+        // lados que tocan vis0
+        const sides:[("L"|"R"|"U"|"D"),number,number][] = [
+          ["L",r,c-1],["R",r,c+1],["U",r-1,c],["D",r+1,c],
+        ]
+        sides.forEach(([dir,nr,nc],i)=>{
+          if(!vis0.has(`${nr}:${nc}`)) return
+          for(let s=0;s<SEG;s++){
+            const t0 = s/SEG, t1 = (s+1)/SEG
+            const n = rand01(r*31+s, c*17+i, 701) // ruido 1D
+            const creep = (FOG_CREEP_MIN + (FOG_CREEP_MAX-FOG_CREEP_MIN)*n)*size
+
+            if(dir==="L"){
+              const yy = y + t0*size
+              const hh = (t1-t0)*size
+              ctx.fillRect(x, yy, Math.max(1,creep), hh)
+            } else if(dir==="R"){
+              const yy = y + t0*size
+              const hh = (t1-t0)*size
+              ctx.fillRect(x+size-creep, yy, Math.max(1,creep), hh)
+            } else if(dir==="U"){
+              const xx = x + t0*size
+              const ww = (t1-t0)*size
+              ctx.fillRect(xx, y, ww, Math.max(1,creep))
+            } else {
+              const xx = x + t0*size
+              const ww = (t1-t0)*size
+              ctx.fillRect(xx, y+size-creep, ww, Math.max(1,creep))
+            }
           }
         })
       })
