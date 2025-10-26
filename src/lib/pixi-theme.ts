@@ -1,38 +1,26 @@
 // src/lib/pixi-theme.ts
 export type Theme = {
-  bg: number;            // color de fondo del canvas
-  bgAlpha: number;       // alpha del fondo
-  grid: number;          // color de líneas de grilla
-  gridAlpha: number;     // alpha de grilla
-  glow: number;          // color del glow/halo
-  frameAlpha: number;    // alpha del contorno fino
-  emptyGlowAlpha: number;// alpha del glow cuando no hay imagen
+  bg: number; bgAlpha: number
+  grid: number; gridAlpha: number
+  glow: number; frameAlpha: number; emptyGlowAlpha: number
+  // Opcional: si planeas dar “lift” solo en dark, déjalo. Si no lo usas, quítalo.
+  visibleLift?: number
 }
 
-// Paleta clara: arena + dorados
 export const THEME_LIGHT: Theme = {
-  bg: 0xF4EDE1,      // arena
-  bgAlpha: 1,
-  grid: 0xC8B79D,    // marrón claro
-  gridAlpha: 0.55,
-  glow: 0xE7B94A,    // dorado
-  frameAlpha: 0.75,
-  emptyGlowAlpha: 0.9,
+  bg: 0xF2EBDD, bgAlpha: 1,
+  grid: 0xC9BDA7, gridAlpha: 0.55,
+  glow: 0xE7B94A, frameAlpha: 0.70, emptyGlowAlpha: 0.90,
+  // visibleLift: 0, // si quieres especificarlo
 }
 
-// Paleta oscura: fondo tenue y glow blanco
 export const THEME_DARK: Theme = {
-  bg: 0x0B0B0B,
-  bgAlpha: 0.08,     // solo un velo sutil
-  grid: 0x888888,
-  gridAlpha: 0.35,
-  glow: 0xFFFFFF,    // blanco
-  frameAlpha: 0.55,
-  emptyGlowAlpha: 0.85,
+  bg: 0x0B0B0B, bgAlpha: 0.12,
+  grid: 0x6B6B6B, gridAlpha: 0.28,
+  glow: 0xFFFFFF, frameAlpha: 0.50, emptyGlowAlpha: 0.85,
+  // visibleLift: 0.06, // si decides usar ese “lift” en dark
 }
 
-// Next Themes nos da el modo, lo guardamos aquí para que lo lea draw()
-export const themeModeRef = { current: "light" as "light" | "dark" }
-
+export const themeModeRef = { current: 'light' as 'light' | 'dark' }
 export const getTheme = () =>
-  themeModeRef.current === "dark" ? THEME_DARK : THEME_LIGHT
+  (themeModeRef.current === 'dark' ? THEME_DARK : THEME_LIGHT)

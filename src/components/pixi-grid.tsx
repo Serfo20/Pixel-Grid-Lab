@@ -1,13 +1,23 @@
 "use client"
 import { useEffect, useRef, useState } from "react"
-import { Application, Graphics, Sprite, Texture, BlurFilter } from "pixi.js"
+import { Application, Graphics, Sprite, Texture, BlurFilter, TilingSprite } from "pixi.js"
 import { useGrid } from "@/store/grid-store"
 import { pixelateFile } from "@/lib/pixelate"
 import { Crosshair } from "lucide-react"
 import { useTheme } from "next-themes"
 import { getTheme, themeModeRef } from "@/lib/pixi-theme"
+// ⚠️ Import avanzado fuera (causa cuadro blanco):
+// import "pixi.js/advanced-blend-modes"
 
-// ——— Visual
+import {
+  createFogTexture,
+  FOG_TINT, FOG_ALPHA, FOG_FEATHER,
+  FOG_CREEP_MIN, FOG_CREEP_MAX, FOG_CREEP_ALPHA,
+  FOG_CREEP_BLOBS, FOG_CREEP_BLOB_R_MIN, FOG_CREEP_BLOB_R_MAX,
+  rand01
+} from "@/lib/pixi-fog"
+
+/* --------- Tweaks visuales --------- */
 const HOVER_GROW = 0.50
 const GLOW_STRENGTH_BASE = 6
 const GLOW_STRENGTH_GROW = 10
@@ -16,43 +26,98 @@ const GLOW_STROKE_GROW = 2
 const GLOW_EMPTY_STRENGTH = 4
 const GLOW_EMPTY_STROKE = 2
 
-// ——— Timings
-const GLOW_EASE = 0.22   // glow rápido
-const GROW_EASE = 0.08   // crecimiento suave
+/* --------- Timings --------- */
+const GLOW_EASE = 0.22
+const GROW_EASE = 0.08
 
-// ——— Zoom
+/* --------- Zoom --------- */
 const ZOOM_MIN = 0.5
 const ZOOM_MAX = 4
 const ZOOM_SENSITIVITY = 0.0015
-const ZOOM_EASE = 0.18   // suavizado del zoom
+const ZOOM_EASE = 0.18
 
-// ——— Inercia de pan
-const INERTIA_FRICTION = 0.0015   // fricción (más alto = se frena antes)
-const INERTIA_MIN_SPEED = 0.008   // px/ms: umbral para cortar inercia
-const INERTIA_MAX_SPEED = 2.5     // px/ms: techo de velocidad inicial
+/* --------- Pan inercial --------- */
+const INERTIA_FRICTION = 0.0015
+const INERTIA_MIN_SPEED = 0.008
+const INERTIA_MAX_SPEED = 2.5
 
-// ——— Fly a 0,0
-const FLY_SPEED = 0.004           // más alto = más rápido
+/* --------- Fly to (0,0) --------- */
+const FLY_SPEED = 0.004
 const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3)
 
-// ——— Imagen inicial
+/* --------- Preload --------- */
 const PRELOADS: Array<{ key: string; url: string }> = [
   { key: "0:0", url: "/assets/tree.png" },
 ]
 
-// ——— Audio SFX (cambia solo esta base para probar otros sonidos)
+/* --------- SFX --------- */
 type SfxExt = "mp3" | "ogg" | "wav"
-const HOVER_SFX_BASE = "/sfx/4"      // ← incluye la carpeta y el slash inicial
-const HOVER_SFX_EXT: SfxExt = "wav"  // "mp3" | "ogg" | "wav"
+const HOVER_SFX_BASE = "/sfx/4"
+const HOVER_SFX_EXT: SfxExt = "wav"
 const HOVER_SFX_VOLUME = 0.08
-const HOVER_SFX_URL = `${HOVER_SFX_BASE}.${HOVER_SFX_EXT}` // "/sfx/1.wav"
+const HOVER_SFX_URL = `${HOVER_SFX_BASE}.${HOVER_SFX_EXT}`
 
-// la cámara intentará mantener la celda dentro de este margen en px
+/* --------- Cámara --------- */
 const FOLLOW_MARGIN_PX = 72
+
+/* --------- Fog --------- */
+const FOG_HOLE_PAD = 6
+const FOG_ANIM_SPEED_X = 0.015
+const FOG_ANIM_SPEED_Y = 0.008
+const fogTexRef = { current: null as Texture | null }
+const fogOffsetRef = { current: { x: 0, y: 0 } }
+
+/* --------- “Anillo” de transición de color entre visibles y niebla --------- */
+// Overlay de sombreado (negro) con fade hacia las adyacentes
+const RING_FADE = 0.34    // ancho del fade (fracción de tile)
+const RING_BLOBS = 2      // blobs que rompen líneas rectas en el fade
+const RING_BLOB_R_MIN = 0.08
+const RING_BLOB_R_MAX = 0.18
+
+// alpha del sombreado según tema (más visible en dark)
+const SHADE_ALPHA_DARK = 0.22
+const SHADE_ALPHA_LIGHT = 0.12
+
+// overlay blanco para subir luz en visibles (centro+adyacentes)
+const VISIBLE_OVERLAY_ALPHA_DARK = 0.14
+const VISIBLE_OVERLAY_ALPHA_LIGHT = 0.06
+
+/* --------- Util ---------- */
+const expandKeys = (src: Set<string>, radius = 1) => {
+  const out = new Set(src)
+  src.forEach(k => {
+    const [r, c] = k.split(":").map(Number)
+    for (let dr = -radius; dr <= radius; dr++) {
+      for (let dc = -radius; dc <= radius; dc++) {
+        out.add(`${r + dr}:${c + dc}`)
+      }
+    }
+  })
+  return out
+}
+
+/* --------- Paletas base de celdas (light/dark) --------- */
+const TILE = {
+  light: { near: 0xF2EFE6, far: 0xE6E0D6 },
+  dark:  { near: 0x2C2F32, far: 0x141619 },
+}
+const getTilePalette = () => themeModeRef.current === "dark" ? TILE.dark : TILE.light
 
 export default function PixiGrid() {
   const containerRef = useRef<HTMLDivElement>(null)
   const appRef = useRef<Application | null>(null)
+
+  // Canvas 2D para la máscara del FOG (perforaciones)
+  const fogMaskCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const fogMaskCtxRef    = useRef<CanvasRenderingContext2D | null>(null)
+  const fogMaskTexRef    = useRef<Texture | null>(null)
+  const fogMaskSpriteRef = useRef<Sprite | null>(null)
+
+  // Canvas 2D para el “anillo” de sombra con degradado orgánico
+  const ringCanvasRef  = useRef<HTMLCanvasElement | null>(null)
+  const ringCtxRef     = useRef<CanvasRenderingContext2D | null>(null)
+  const ringTexRef     = useRef<Texture | null>(null)
+  const ringSpriteRef  = useRef<Sprite | null>(null)
 
   const { resolvedTheme } = useTheme()
   useEffect(() => {
@@ -61,151 +126,106 @@ export default function PixiGrid() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolvedTheme])
 
-  // cámara/pan
+  // Cámara / pan
   const originRef = useRef({ x: 0, y: 0 })
   const dragRef = useRef<{ active: boolean; x: number; y: number }>({ active: false, x: 0, y: 0 })
   const spaceDownRef = useRef(false)
 
-  // estado “vivo”
+  // Estado de la grilla
   const { cellPx, cells, setCell } = useGrid()
   const cellPxRef = useRef(cellPx)
   const cellsRef = useRef(cells)
   useEffect(() => { cellPxRef.current = cellPx }, [cellPx])
   useEffect(() => { cellsRef.current = cells; draw() }, [cells])
 
-  // hover
+  // Hover
   const hoverKeyRef = useRef<string | null>(null)
   const hoverLockRef = useRef<string | null>(null)
-  const hoverGlowTRef = useRef(0) // 0..1 (rápido)
-  const hoverGrowTRef = useRef(0) // 0..1 (lento)
+  const hoverGlowTRef = useRef(0)
+  const hoverGrowTRef = useRef(0)
 
   // SFX
   const hoverSfxRef = useRef<HTMLAudioElement | null>(null)
   const lastSfxTsRef = useRef(0)
-  const audioUnlockedRef = useRef(false) // ← NUEVO
+  const audioUnlockedRef = useRef(false)
 
-  // coordenadas (cartesiano: y hacia arriba)
+  // Coordenadas HUD
   const [hoverCoord, setHoverCoord] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
 
-  // zoom (suave + anclado a celda)
-  const zoomRef = useRef(1)         // actual
-  const zoomTargetRef = useRef(1)   // objetivo
+  // Zoom (suave + ancla)
+  const zoomRef = useRef(1)
+  const zoomTargetRef = useRef(1)
   const zoomAnchorRef = useRef<{ c: number; r: number; fx: number; fy: number; localX: number; localY: number } | null>(null)
 
-  // cursor nativo
+  // Cursor nativo
   const [cursor, setCursor] = useState<"default" | "grab" | "grabbing" | "pointer">("default")
 
-  // visor
+  // Visor
   const [viewerUrl, setViewerUrl] = useState<string | null>(null)
 
   const sizeNow = () => cellPxRef.current * zoomRef.current
 
-  // Desplaza (con easing usando tu mismo flyRef) la cámara si el tile (r,c) queda fuera del viewport (+ margen)
+  // Asegura que (r,c) quede visible (con margen)
   const ensureCellVisible = (r: number, c: number) => {
     const app = appRef.current
     if (!app) return
-
     const size = sizeNow()
     const w = app.renderer.width
     const h = app.renderer.height
-
     const ox = originRef.current.x
     const oy = originRef.current.y
-
-    // posición en pantalla del tile actual
     const screenX = c * size - ox
     const screenY = r * size - oy
-
-    let targetOx = ox
-    let targetOy = oy
+    let targetOx = ox, targetOy = oy
     const pad = FOLLOW_MARGIN_PX
-
-    // Horizontal
-    if (screenX < pad) {
-      // mover tile a la derecha → disminuir origin.x
-      targetOx -= (pad - screenX)
-    } else if (screenX + size > w - pad) {
-      // mover tile a la izquierda → aumentar origin.x
-      targetOx += (screenX + size - (w - pad))
-    }
-
-    // Vertical
-    if (screenY < pad) {
-      // mover tile hacia abajo → disminuir origin.y
-      targetOy -= (pad - screenY)
-    } else if (screenY + size > h - pad) {
-      // mover tile hacia arriba → aumentar origin.y
-      targetOy += (screenY + size - (h - pad))
-    }
-
-    // Si hay ajuste, animamos con tu mismo sistema de "fly"
+    if (screenX < pad) targetOx -= (pad - screenX)
+    else if (screenX + size > w - pad) targetOx += (screenX + size - (w - pad))
+    if (screenY < pad) targetOy -= (pad - screenY)
+    else if (screenY + size > h - pad) targetOy += (screenY + size - (h - pad))
     if (targetOx !== ox || targetOy !== oy) {
       inertiaActiveRef.current = false
       velRef.current = { x: 0, y: 0 }
-
-      flyRef.current = {
-        active: true,
-        t: 0,
-        start: { x: ox, y: oy },
-        target: { x: targetOx, y: targetOy },
-      }
+      flyRef.current = { active: true, t: 0, start: { x: ox, y: oy }, target: { x: targetOx, y: targetOy } }
     }
   }
 
-  // inercia
-  const velRef = useRef({ x: 0, y: 0 })           // px/ms
+  // Inercia
+  const velRef = useRef({ x: 0, y: 0 })
   const lastMoveTsRef = useRef<number>(0)
   const inertiaActiveRef = useRef(false)
 
-  // fly-to-center
-  const flyRef = useRef({
-    active: false,
-    t: 0,
-    start: { x: 0, y: 0 },
-    target: { x: 0, y: 0 },
-  })
+  // Fly to center
+  const flyRef = useRef({ active: false, t: 0, start: { x: 0, y: 0 }, target: { x: 0, y: 0 } })
 
-  // Mueve el hover a (r,c) aplicando grow/glow, SFX, cursor y follow camera
+  // Ir al tile
   const gotoCell = (r: number, c: number) => {
     const key = `${r}:${c}`
     const changed = hoverKeyRef.current !== key
-
     hoverKeyRef.current = key
-    if (changed) {
-      hoverGrowTRef.current = 0
-      hoverGlowTRef.current = 1
-    }
+    if (changed) { hoverGrowTRef.current = 0; hoverGlowTRef.current = 1 }
     setHoverCoord({ x: c, y: -r })
 
-    // SFX si tiene imagen (con antispam)
+    // SFX si hay imagen
     if (changed && cellsRef.current[key]?.canvas) {
       const now = performance.now()
       if (now - lastSfxTsRef.current > 100) {
         const a = hoverSfxRef.current
-        if (a) {
-          try { a.currentTime = 0; a.play() } catch {}
-        }
+        if (a) { try { a.currentTime = 0; a.play().catch(() => {}) } catch {} }
         lastSfxTsRef.current = now
       }
     }
 
-    // Cursor: pointer solo si hay imagen en la celda
     if (!dragRef.current.active) {
-      const hasImg = !!cellsRef.current[key]?.canvas
-      setCursor(hasImg ? "pointer" : "default")
+      setCursor(cellsRef.current[key]?.canvas ? "pointer" : "default")
     }
-
-    // 🔥 Asegura visibilidad cuando venimos por teclado
     ensureCellVisible(r, c)
-
     draw()
   }
 
-  // ——— init Pixi v8
+  // Init Pixi
   useEffect(() => {
     if (!containerRef.current || appRef.current) return
     let disposed = false
-
     ;(async () => {
       const app = new Application()
       await app.init({
@@ -218,34 +238,43 @@ export default function PixiGrid() {
       })
       if (disposed) { app.destroy(); return }
       containerRef.current!.appendChild(app.canvas as HTMLCanvasElement)
-
-      const canvas = app.canvas as HTMLCanvasElement
-      canvas.style.display = "block"
-      canvas.style.width = "100%"
-      canvas.style.height = "100%"
-      canvas.style.cursor = "inherit"
-
+      ;(app.canvas as HTMLCanvasElement).style.cssText = "display:block;width:100%;height:100%;cursor:inherit"
       app.stage.sortableChildren = true
       appRef.current = app
 
-      // centrar (0,0) en el centro de la pantalla
+      // Fog mask canvas
+      const maskCanvas = document.createElement("canvas")
+      maskCanvas.width = app.renderer.width
+      maskCanvas.height = app.renderer.height
+      fogMaskCanvasRef.current = maskCanvas
+      fogMaskCtxRef.current = maskCanvas.getContext("2d", { alpha: true })!
+      fogMaskTexRef.current = Texture.from(maskCanvas)
+      fogMaskSpriteRef.current = new Sprite(fogMaskTexRef.current)
+
+      // Ring (tone) canvas
+      const ringCanvas = document.createElement("canvas")
+      ringCanvas.width = app.renderer.width
+      ringCanvas.height = app.renderer.height
+      ringCanvasRef.current = ringCanvas
+      ringCtxRef.current = ringCanvas.getContext("2d", { alpha: true })!
+      ringTexRef.current = Texture.from(ringCanvas)
+      ringSpriteRef.current = new Sprite(ringTexRef.current)
+
+      // Centro inicial
       const size = cellPxRef.current * zoomRef.current
-      const w = app.renderer.width
-      const h = app.renderer.height
+      const w = app.renderer.width, h = app.renderer.height
       originRef.current.x = (0.5 * size) - w / 2
       originRef.current.y = (0.5 * size) - h / 2
 
-      // foco inicial en (0,0)
       hoverKeyRef.current = "0:0"
       hoverGlowTRef.current = 1
       hoverGrowTRef.current = 0
       setHoverCoord({ x: 0, y: 0 })
       draw()
 
-      // ticker: glow/grow + zoom suave + ancla + inercia + fly
+      // Ticker
       app.ticker.add(() => {
         let needsDraw = false
-
         // glow
         {
           const target = hoverKeyRef.current ? 1 : 0
@@ -258,14 +287,12 @@ export default function PixiGrid() {
           const ng = hoverGrowTRef.current + (target - hoverGrowTRef.current) * GROW_EASE
           if (Math.abs(ng - hoverGrowTRef.current) > 0.001) { hoverGrowTRef.current = ng; needsDraw = true }
         }
-        // zoom suave + ancla
+        // zoom suave
         {
-          const z = zoomRef.current
-          const zt = zoomTargetRef.current
+          const z = zoomRef.current, zt = zoomTargetRef.current
           if (Math.abs(zt - z) > 1e-4) {
             const newZ = z + (zt - z) * ZOOM_EASE
             zoomRef.current = newZ
-
             const anchor = zoomAnchorRef.current
             if (anchor) {
               const size = sizeNow()
@@ -273,22 +300,17 @@ export default function PixiGrid() {
               originRef.current.y = (anchor.r + anchor.fy) * size - anchor.localY
             }
             needsDraw = true
-          } else if (zoomAnchorRef.current) {
-            zoomAnchorRef.current = null
-          }
+          } else if (zoomAnchorRef.current) zoomAnchorRef.current = null
         }
         // inercia pan
         {
           const dragging = dragRef.current.active
           if (inertiaActiveRef.current && !dragging) {
-            const dt = app.ticker.elapsedMS // ms
+            const dt = app.ticker.elapsedMS
             originRef.current.x -= velRef.current.x * dt
             originRef.current.y -= velRef.current.y * dt
-
             const decay = Math.exp(-INERTIA_FRICTION * dt)
-            velRef.current.x *= decay
-            velRef.current.y *= decay
-
+            velRef.current.x *= decay; velRef.current.y *= decay
             if (Math.hypot(velRef.current.x, velRef.current.y) < INERTIA_MIN_SPEED) {
               inertiaActiveRef.current = false
               velRef.current = { x: 0, y: 0 }
@@ -296,7 +318,7 @@ export default function PixiGrid() {
             needsDraw = true
           }
         }
-        // fly-to-center
+        // fly
         {
           if (flyRef.current.active) {
             const dt = app.ticker.elapsedMS
@@ -309,6 +331,11 @@ export default function PixiGrid() {
           }
         }
 
+        // animar tile del fog
+        fogOffsetRef.current.x = (fogOffsetRef.current.x + FOG_ANIM_SPEED_X * app.ticker.elapsedMS) % 100000
+        fogOffsetRef.current.y = (fogOffsetRef.current.y + FOG_ANIM_SPEED_Y * app.ticker.elapsedMS) % 100000
+        needsDraw = true
+
         if (needsDraw) draw()
       })
     })()
@@ -317,33 +344,33 @@ export default function PixiGrid() {
       const app = appRef.current
       const el = containerRef.current
       if (!app || !el) return
-
-      const w = el.clientWidth
-      const h = Math.max(320, el.clientHeight)
+      const w = el.clientWidth, h = Math.max(320, el.clientHeight)
       app.renderer.resize(w, h)
 
-      // mantener la celda (0,0) al centro
+      if (fogMaskCanvasRef.current && fogMaskTexRef.current) {
+        fogMaskCanvasRef.current.width = w
+        fogMaskCanvasRef.current.height = h
+        ;(fogMaskTexRef.current as any).source?.update?.()
+      }
+      if (ringCanvasRef.current && ringTexRef.current) {
+        ringCanvasRef.current.width = w
+        ringCanvasRef.current.height = h
+        ;(ringTexRef.current as any).source?.update?.()
+      }
+
       const size = cellPxRef.current * zoomRef.current
       originRef.current.x = (0.5 * size) - w / 2
       originRef.current.y = (0.5 * size) - h / 2
-
       draw()
     }
     window.addEventListener("resize", onResize)
-
-    // Observa cambios reales del contenedor (no solo window)
-    let ro: ResizeObserver | null = new ResizeObserver(() => {
-      onResize()
-    })
+    let ro: ResizeObserver | null = new ResizeObserver(onResize)
     if (containerRef.current) ro.observe(containerRef.current)
 
-    // Recalcular tras primer layout/paddings
     requestAnimationFrame(() => {
-      const app = appRef.current
-      const el = containerRef.current
+      const app = appRef.current, el = containerRef.current
       if (!app || !el) return
-      const w = el.clientWidth
-      const h = Math.max(320, el.clientHeight)
+      const w = el.clientWidth, h = Math.max(320, el.clientHeight)
       app.renderer.resize(w, h)
       const size = cellPxRef.current * zoomRef.current
       originRef.current.x = (0.5 * size) - w / 2
@@ -355,43 +382,36 @@ export default function PixiGrid() {
     audio.preload = "auto"
     audio.volume = HOVER_SFX_VOLUME
     hoverSfxRef.current = audio
-
-    // Desbloqueo en la primera interacción (iOS/Safari)
     const unlockAudio = () => {
       const a = hoverSfxRef.current
       if (!a) return
       a.muted = true
-      a.play()
-        .then(() => {
-          a.pause()
-          a.currentTime = 0
-          a.muted = false
-          audioUnlockedRef.current = true
-        })
-        .catch(() => { /* ignorar */ })
+      a.play().then(() => { a.pause(); a.currentTime = 0; a.muted = false; audioUnlockedRef.current = true }).catch(() => {})
     }
     window.addEventListener("pointerdown", unlockAudio, { once: true })
-    window.addEventListener("keydown",   unlockAudio, { once: true })
+    window.addEventListener("keydown", unlockAudio, { once: true })
+
+    fogTexRef.current = createFogTexture(256, 18)
 
     return () => {
-      disposed = true
       window.removeEventListener("resize", onResize)
       if (ro) { ro.disconnect(); ro = null }
-
       const app = appRef.current
       if (app) { app.destroy(true, { children: true, texture: true }); appRef.current = null }
     }
   }, [])
 
-  // ——— draw
+  // DRAW
   const draw = () => {
     const app = appRef.current
     if (!app) return
 
-    const theme = getTheme()
+    const vis0 = getVisibleKeys()        // centro + adyacentes
+    const fogClear = vis0  
+    const ring1 = new Set([...fogClear].filter(k => !vis0.has(k))) // “anillo” entre visibles y fog real
 
-    const w = app.renderer.width
-    const h = app.renderer.height
+    const theme = getTheme()
+    const w = app.renderer.width, h = app.renderer.height
     const { x: ox, y: oy } = originRef.current
     const size = sizeNow()
     const data = cellsRef.current
@@ -401,20 +421,128 @@ export default function PixiGrid() {
 
     app.stage.removeChildren()
 
-    // fondo + grilla infinita (tematizados)
-    const g = new Graphics()
-    g.rect(0, 0, w, h).fill({ color: theme.bg, alpha: theme.bgAlpha })
-    g.setStrokeStyle({ width: 1, color: theme.grid, alpha: theme.gridAlpha })
+    // 0) Fondo del tema
+    const bg = new Graphics()
+    bg.rect(0, 0, w, h).fill({ color: theme.bg, alpha: theme.bgAlpha })
+    app.stage.addChild(bg)
 
+    /* 0.5) Suelo por tiles con 2 paletas (near = vis0; far = resto) */
+    {
+      const cols = getTilePalette()
+      const tiles = new Graphics()
+      const minC = Math.floor(ox / size) - 2
+      const maxC = Math.floor((ox + w) / size) + 2
+      const minR = Math.floor(oy / size) - 2
+      const maxR = Math.floor((oy + h) / size) + 2
+
+      for (let r = minR; r <= maxR; r++) {
+        for (let c = minC; c <= maxC; c++) {
+          const key = `${r}:${c}`
+          const fill = vis0.has(key) ? cols.near : cols.far
+          tiles.rect(c * size - ox, r * size - oy, size, size).fill({ color: fill, alpha: 1 })
+        }
+      }
+      app.stage.addChild(tiles)
+    }
+
+    // 1) Tiles VISIBLES (centro + adyacentes) → overlay blanco para aclarar
+    // {
+    //   const a = themeModeRef.current === "dark" ? VISIBLE_OVERLAY_ALPHA_DARK : VISIBLE_OVERLAY_ALPHA_LIGHT
+    //   const visBG = new Graphics()
+    //   vis0.forEach(key => {
+    //     const [r, c] = key.split(":").map(Number)
+    //     const x = c * size - ox, y = r * size - oy
+    //     visBG.roundRect(x, y, size, size, 8).fill({ color: 0xffffff, alpha: a })
+    //   })
+    //   app.stage.addChild(visBG)
+    // }
+
+    // 1.5) Overlay de transición (anillo): sombreado con degradado orgánico hacia afuera
+    // if (ringCtxRef.current && ringSpriteRef.current && ringTexRef.current) {
+    //   const ctx = ringCtxRef.current
+    //   const shadeAlpha = themeModeRef.current === "dark" ? SHADE_ALPHA_DARK : SHADE_ALPHA_LIGHT
+    //   const fadeFrac = RING_FADE
+
+    //   // reset canvas
+    //   if (ringCanvasRef.current && (ringCanvasRef.current.width !== w || ringCanvasRef.current.height !== h)) {
+    //     ringCanvasRef.current.width = w
+    //     ringCanvasRef.current.height = h
+    //   }
+    //   ctx.clearRect(0, 0, w, h)
+
+    //   ring1.forEach(key => {
+    //     const [r, c] = key.split(":").map(Number)
+    //     const x = c * size - ox, y = r * size - oy
+
+    //     // Sombreado base de toda la celda
+    //     ctx.globalCompositeOperation = "source-over"
+    //     ctx.fillStyle = `rgba(0,0,0,${shadeAlpha})`
+    //     ctx.fillRect(x, y, size, size)
+
+    //     // Borrar (fade) hacia las celdas vis0 vecinas
+    //     ctx.globalCompositeOperation = "destination-out"
+    //     const sides: Array<["L"|"R"|"U"|"D", number, number]> = [
+    //       ["L", r, c - 1],
+    //       ["R", r, c + 1],
+    //       ["U", r - 1, c],
+    //       ["D", r + 1, c],
+    //     ]
+    //     sides.forEach(([dir, nr, nc], i) => {
+    //       if (!vis0.has(`${nr}:${nc}`)) return
+    //       const v = rand01(r, c, 900 + i)
+    //       const fade = fadeFrac * size * (0.85 + 0.3 * v) // ancho variable
+
+    //       const grad =
+    //         dir === "L" ? ctx.createLinearGradient(x, 0, x + fade, 0) :
+    //         dir === "R" ? ctx.createLinearGradient(x + size, 0, x + size - fade, 0) :
+    //         dir === "U" ? ctx.createLinearGradient(0, y, 0, y + fade) :
+    //                       ctx.createLinearGradient(0, y + size, 0, y + size - fade)
+
+    //       // borrar más cerca del borde interior
+    //       grad.addColorStop(0, `rgba(0,0,0,${shadeAlpha})`)
+    //       grad.addColorStop(1, `rgba(0,0,0,0)`)
+    //       ctx.fillStyle = grad
+
+    //       if (dir === "L") ctx.fillRect(x, y, fade, size)
+    //       if (dir === "R") ctx.fillRect(x + size - fade, y, fade, size)
+    //       if (dir === "U") ctx.fillRect(x, y, size, fade)
+    //       if (dir === "D") ctx.fillRect(x, y + size - fade, size, fade)
+
+    //       // blobs que muerden el borde del fade (orgánico)
+    //       for (let b = 0; b < RING_BLOBS; b++) {
+    //         const u = rand01(r + b * 3, c + i * 5, 777)
+    //         const wv = rand01(r + b * 7, c + i * 11, 999)
+    //         const rad = (RING_BLOB_R_MIN + (RING_BLOB_R_MAX - RING_BLOB_R_MIN) * wv) * size
+    //         let cx = x, cy = y
+    //         if (dir === "L") { cx = x + fade * (0.4 + 0.5 * wv); cy = y + u * size }
+    //         if (dir === "R") { cx = x + size - fade * (0.4 + 0.5 * wv); cy = y + u * size }
+    //         if (dir === "U") { cx = x + u * size; cy = y + fade * (0.4 + 0.5 * wv) }
+    //         if (dir === "D") { cx = x + u * size; cy = y + size - fade * (0.4 + 0.5 * wv) }
+    //         ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fill()
+    //       }
+    //     })
+
+    //     ctx.globalCompositeOperation = "source-over"
+    //   })
+
+    //   ;(ringTexRef.current as any).source?.update?.()
+    //   ringSpriteRef.current.x = 0
+    //   ringSpriteRef.current.y = 0
+    //   app.stage.addChild(ringSpriteRef.current)
+    // }
+
+    // 2) Grilla
+    const grid = new Graphics()
+    grid.setStrokeStyle({ width: 1, color: theme.grid, alpha: theme.gridAlpha })
     const mod = (a: number, n: number) => ((a % n) + n) % n
     const startX = -mod(ox, size)
     const startY = -mod(oy, size)
-    for (let x = startX; x <= w; x += size) g.moveTo(x, 0).lineTo(x, h)
-    for (let y = startY; y <= h; y += size) g.moveTo(0, y).lineTo(w, y)
-    g.stroke()
-    app.stage.addChild(g)
+    for (let x = startX; x <= w; x += size) grid.moveTo(x, 0).lineTo(x, h)
+    for (let y = startY; y <= h; y += size) grid.moveTo(0, y).lineTo(w, y)
+    grid.stroke()
+    app.stage.addChild(grid)
 
-    // sprites
+    // 3) Sprites
     Object.entries(data).forEach(([key, cell]) => {
       const cvs = cell.canvas
       if (!cvs) return
@@ -427,7 +555,6 @@ export default function PixiGrid() {
       const base = Math.min(1, size / cvs.width, size / cvs.height)
       const grown = key === hoverKey ? (1 + HOVER_GROW * growT) : 1
       const scale = base * grown
-
       sp.scale.set(scale)
       sp.x = cellX + (size - cvs.width * base) / 2 - (cvs.width * base) * (grown - 1) / 2
       sp.y = cellY + (size - cvs.height * base) / 2 - (cvs.height * base) * (grown - 1) / 2
@@ -435,71 +562,147 @@ export default function PixiGrid() {
       app.stage.addChild(sp)
     })
 
-    // glow (vacía o con imagen)
+    // 4) FOG (tile animado + máscara con bordes orgánicos)
+    // 4) FOG …
+    if (fogTexRef.current && fogMaskCtxRef.current && fogMaskSpriteRef.current && fogMaskTexRef.current) {
+      const fog = new TilingSprite({ texture: fogTexRef.current, width: w, height: h })
+
+      // yo: tinte negro SIEMPRE; alpha un poco mayor para que nunca “aclare” fuera
+      const fogAlpha = themeModeRef.current === "dark" ? 0.55 : 0.42
+      fog.tint  = 0x000000
+      fog.alpha = fogAlpha
+      fog.tilePosition.set(fogOffsetRef.current.x, fogOffsetRef.current.y)
+
+      const ctx = fogMaskCtxRef.current
+      ctx.clearRect(0, 0, w, h)
+
+      // lleno máscara (niebla total)
+      ctx.globalCompositeOperation = "source-over"
+      ctx.fillStyle = "rgba(255,255,255,1)"
+      ctx.fillRect(0, 0, w, h)
+
+      // abro claros SOLO en vis0, con feather
+      ctx.globalCompositeOperation = "destination-out"
+
+      // yo: muerdo 2px hacia adentro para que no quede halo claro en el borde
+      const holePad = -2
+      ctx.filter = `blur(${FOG_FEATHER}px)`
+      const s2 = size - holePad * 2
+      vis0.forEach(key => {
+        const [r, c] = key.split(":").map(Number)
+        const x = c * size - ox + holePad
+        const y = r * size - oy + holePad
+        ctx.fillRect(x, y, s2, s2)
+      })
+      ctx.filter = "none"
+
+      // mordidas orgánicas SOLO hacia afuera (vecino NO visible)
+      ctx.globalAlpha = FOG_CREEP_ALPHA
+      vis0.forEach(key => {
+        const [r, c] = key.split(":").map(Number)
+        const x = c * size - ox, y = r * size - oy
+        const sides: Array<["L"|"R"|"U"|"D", number, number]> = [
+          ["L", r, c - 1], ["R", r, c + 1], ["U", r - 1, c], ["D", r + 1, c],
+        ]
+        sides.forEach(([dir, nr, nc], i) => {
+          if (vis0.has(`${nr}:${nc}`)) return
+          const t = rand01(r, c, 101 + i)
+          const creep = (FOG_CREEP_MIN + (FOG_CREEP_MAX - FOG_CREEP_MIN) * t) * size
+          if (dir === "L") ctx.fillRect(x, y, creep, size)
+          if (dir === "R") ctx.fillRect(x + size - creep, y, creep, size)
+          if (dir === "U") ctx.fillRect(x, y, size, creep)
+          if (dir === "D") ctx.fillRect(x, y + size - creep, size, creep)
+
+          for (let b = 0; b < FOG_CREEP_BLOBS; b++) {
+            const u = rand01(r + b * 3, c + i * 5, 777)
+            const v = rand01(r + b * 7, c + i * 11, 999)
+            const rad = (FOG_CREEP_BLOB_R_MIN + (FOG_CREEP_BLOB_R_MAX - FOG_CREEP_BLOB_R_MIN) * v) * size
+            let cx = x, cy = y
+            if (dir === "L") { cx = x + creep * (0.55 + 0.35 * v); cy = y + u * size }
+            if (dir === "R") { cx = x + size - creep * (0.55 + 0.35 * v); cy = y + u * size }
+            if (dir === "U") { cx = x + u * size; cy = y + creep * (0.55 + 0.35 * v) }
+            if (dir === "D") { cx = x + u * size; cy = y + size - creep * (0.55 + 0.35 * v) }
+            ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fill()
+          }
+        })
+      })
+      ctx.globalAlpha = 1
+      ctx.globalCompositeOperation = "source-over"
+
+      ;(fogMaskTexRef.current as any).source?.update?.()
+      fog.mask = fogMaskSpriteRef.current!
+      app.stage.addChild(fog)
+      app.stage.addChild(fogMaskSpriteRef.current!)
+    }
+
+
+
+    // 5) Glow/Frame hover
     if (hoverKey) {
       const [r, c] = hoverKey.split(":").map(Number)
       const cellX = c * size - ox
       const cellY = r * size - oy
       const hasImg = !!data[hoverKey]?.canvas
-
       let rx: number, ry: number, rw: number, rh: number
-      let strokeW: number
-      let blurStrength: number
+      let strokeW: number, blurStrength: number
 
       if (hasImg) {
         const cvs = data[hoverKey]!.canvas!
         const base = Math.min(1, size / cvs.width, size / cvs.height)
         const grown = 1 + HOVER_GROW * growT
         const scale = base * grown
-        const gw = cvs.width * scale
-        const gh = cvs.height * scale
+        const gw = cvs.width * scale, gh = cvs.height * scale
         const sx = cellX + (size - cvs.width * base) / 2 - (cvs.width * base) * (grown - 1) / 2
         const sy = cellY + (size - cvs.height * base) / 2 - (cvs.height * base) * (grown - 1) / 2
-
         strokeW = GLOW_STROKE_BASE + (grown - 1) * GLOW_STROKE_GROW
         const padOut = strokeW / 2
         blurStrength = GLOW_STRENGTH_BASE + (grown - 1) * GLOW_STRENGTH_GROW
-
-        rx = sx - padOut
-        ry = sy - padOut
-        rw = gw + padOut * 2
-        rh = gh + padOut * 2
+        rx = sx - padOut; ry = sy - padOut; rw = gw + padOut * 2; rh = gh + padOut * 2
       } else {
         strokeW = GLOW_EMPTY_STROKE
         const padOut = strokeW / 2
         blurStrength = GLOW_EMPTY_STRENGTH
-        rx = cellX - padOut
-        ry = cellY - padOut
-        rw = size + padOut * 2
-        rh = size + padOut * 2
+        rx = cellX - padOut; ry = cellY - padOut; rw = size + padOut * 2; rh = size + padOut * 2
       }
 
       const glow = new Graphics()
-      glow.rect(rx, ry, rw, rh).stroke({
-        width: strokeW,
-        color: theme.glow,
-        alpha: (hasImg ? 0.9 : theme.emptyGlowAlpha) * glowT,
-      })
+      glow.rect(rx, ry, rw, rh).stroke({ width: strokeW, color: theme.glow, alpha: (hasImg ? 0.9 : theme.emptyGlowAlpha) * glowT })
       glow.filters = [new BlurFilter({ strength: blurStrength * glowT })]
       glow.zIndex = 100
       app.stage.addChild(glow)
 
       const frame = new Graphics()
-      frame.rect(rx, ry, rw, rh).stroke({
-        width: 1,
-        color: theme.glow,
-        alpha: theme.frameAlpha * glowT,
-      })
+      frame.rect(rx, ry, rw, rh).stroke({ width: 1, color: theme.glow, alpha: theme.frameAlpha * glowT })
       frame.zIndex = 101
       app.stage.addChild(frame)
     }
   }
 
-  // ——— pan (barra espaciadora) + inercia
+  const getVisibleKeys = (): Set<string> => {
+    const vis = new Set<string>()
+    const data = cellsRef.current
+    const explored: Array<[number, number]> = []
+    Object.keys(data).forEach(k => {
+      if (data[k]?.canvas) {
+        const [r, c] = k.split(":").map(Number)
+        explored.push([r, c])
+      }
+    })
+    if (explored.length === 0) explored.push([0, 0])
+    for (const [r, c] of explored) {
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+          vis.add(`${r + dr}:${c + dc}`)
+        }
+      }
+    }
+    return vis
+  }
+
+  // Pan + inercia
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
-
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code === "Space") {
         if (!spaceDownRef.current) {
@@ -534,50 +737,30 @@ export default function PixiGrid() {
     const onMouseMove = (e: MouseEvent) => {
       if (!dragRef.current.active) return
       const now = performance.now()
-      const dt = Math.max(1, now - lastMoveTsRef.current) // ms
-
+      const dt = Math.max(1, now - lastMoveTsRef.current)
       const dx = e.clientX - dragRef.current.x
       const dy = e.clientY - dragRef.current.y
-      dragRef.current.x = e.clientX
-      dragRef.current.y = e.clientY
+      dragRef.current.x = e.clientX; dragRef.current.y = e.clientY
       lastMoveTsRef.current = now
-
       originRef.current.x -= dx
       originRef.current.y -= dy
-
-      // velocidad instantánea (px/ms) con techo
-      let vx = dx / dt
-      let vy = dy / dt
+      let vx = dx / dt, vy = dy / dt
       const sp = Math.hypot(vx, vy)
-      if (sp > INERTIA_MAX_SPEED) {
-        const k = INERTIA_MAX_SPEED / sp
-        vx *= k; vy *= k
-      }
+      if (sp > INERTIA_MAX_SPEED) { const k = INERTIA_MAX_SPEED / sp; vx *= k; vy *= k }
       velRef.current = { x: vx, y: vy }
-
       draw()
     }
     const endDrag = () => {
       if (!dragRef.current.active) return
       dragRef.current.active = false
-
-      if (spaceDownRef.current) {
-        setCursor("grab")
-      } else {
-        const key = hoverKeyRef.current
-        const hasImg = key ? !!cellsRef.current[key]?.canvas : false
-        setCursor(hasImg ? "pointer" : "default")
-      }
-
+      setCursor(spaceDownRef.current ? "grab" : (hoverKeyRef.current && cellsRef.current[hoverKeyRef.current!]?.canvas ? "pointer" : "default"))
       inertiaActiveRef.current = true
     }
-
     el.addEventListener("mousedown", onMouseDown)
     window.addEventListener("mousemove", onMouseMove)
     window.addEventListener("mouseup", endDrag)
     window.addEventListener("keydown", onKeyDown)
     window.addEventListener("keyup", onKeyUp)
-
     return () => {
       el.removeEventListener("mousedown", onMouseDown)
       window.removeEventListener("mousemove", onMouseMove)
@@ -587,20 +770,16 @@ export default function PixiGrid() {
     }
   }, [])
 
-  // ——— hover tracking (sin pan)
+  // Hover tracking
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
-
     const onEnter = () => { if (!spaceDownRef.current) setCursor("default") }
-
     const onMove = (e: MouseEvent) => {
       const t = e.target as HTMLElement | null
       if (t && t.closest('[data-ui-overlay]')) return
-
       if (hoverLockRef.current) { hoverLockRef.current = null; return }
       if (spaceDownRef.current) { if (hoverKeyRef.current) { hoverKeyRef.current = null; draw() } return }
-
       const rect = el.getBoundingClientRect()
       const localX = e.clientX - rect.left
       const localY = e.clientY - rect.top
@@ -610,43 +789,31 @@ export default function PixiGrid() {
       const r = Math.floor((localY + oy) / size)
       const key = `${r}:${c}`
       const hasImg = !!cellsRef.current[key]?.canvas
-
-      // cursor nativo según tenga imagen
-      if (!dragRef.current.active) {
-        setCursor(hasImg ? "pointer" : "default")
-      }
-
+      if (!dragRef.current.active) setCursor(hasImg ? "pointer" : "default")
       if (hoverKeyRef.current !== key) {
         hoverKeyRef.current = key
         hoverGrowTRef.current = 0
         hoverGlowTRef.current = 1
         setHoverCoord({ x: c, y: -r })
         draw()
-
-        // SFX al entrar a una celda con imagen (antispam ~100ms)
         if (hasImg && audioUnlockedRef.current) {
           const now = performance.now()
           if (now - lastSfxTsRef.current > 100) {
             const a = hoverSfxRef.current
-            if (a) {
-              a.currentTime = 0
-              a.play().catch(() => { /* tragamos NotAllowedError si ocurre */ })
-              lastSfxTsRef.current = now
-            }
+            if (a) { a.currentTime = 0; a.play().catch(() => {}) }
+            lastSfxTsRef.current = now
           }
         }
       } else {
         setHoverCoord({ x: c, y: -r })
       }
     }
-
     const onLeave = () => {
       hoverKeyRef.current = null
       hoverLockRef.current = null
       setCursor("default")
       draw()
     }
-
     el.addEventListener("mouseenter", onEnter)
     el.addEventListener("mousemove", onMove)
     el.addEventListener("mouseleave", onLeave)
@@ -657,65 +824,42 @@ export default function PixiGrid() {
     }
   }, [])
 
-  // Navegación por teclado: WASD / Arrow Keys para mover el hover entre celdas
+  // Teclado (WASD/arrows)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      // No interferir con inputs, ni cuando estás paneando con Space
       const t = e.target as HTMLElement | null
       if (spaceDownRef.current) return
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return
-
       let dx = 0, dy = 0
       switch (e.code) {
-        case "KeyA":
-        case "ArrowLeft":  dx = -1; break
-        case "KeyD":
-        case "ArrowRight": dx = +1; break
-        case "KeyW":
-        case "ArrowUp":    dy = -1; break  // fila arriba = r-1
-        case "KeyS":
-        case "ArrowDown":  dy = +1; break  // fila abajo = r+1
+        case "KeyA": case "ArrowLeft":  dx = -1; break
+        case "KeyD": case "ArrowRight": dx = +1; break
+        case "KeyW": case "ArrowUp":    dy = -1; break
+        case "KeyS": case "ArrowDown":  dy = +1; break
         default: return
       }
       e.preventDefault()
-
-      // Si el botón de “centro” dejó un lock, lo liberamos
       hoverLockRef.current = null
-
-      // Punto de partida: celda actual (o 0,0 si no hay)
       let r = 0, c = 0
-      if (hoverKeyRef.current) {
-        const [rr, cc] = hoverKeyRef.current.split(":").map(Number)
-        r = rr; c = cc
-      }
-
-      // Aplicar movimiento
+      if (hoverKeyRef.current) { const [rr, cc] = hoverKeyRef.current.split(":").map(Number); r = rr; c = cc }
       gotoCell(r + dy, c + dx)
     }
-
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
   }, [])
 
-
-  // ——— rueda: zoom suave anclado a la celda bajo el cursor
+  // Zoom rueda
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
-
     const onWheel = (e: WheelEvent) => {
       const t = e.target as HTMLElement | null
       if (t && t.closest('[data-ui-overlay]')) { e.preventDefault(); return }
-
       e.preventDefault()
-
-      // si estoy volando al centro, lo cancelo
       flyRef.current.active = false
-
       const rect = el.getBoundingClientRect()
       const localX = e.clientX - rect.left
       const localY = e.clientY - rect.top
-
       const size = sizeNow()
       const worldX = localX + originRef.current.x
       const worldY = localY + originRef.current.y
@@ -724,17 +868,14 @@ export default function PixiGrid() {
       const fx = worldX / size - c
       const fy = worldY / size - r
       zoomAnchorRef.current = { c, r, fx, fy, localX, localY }
-
       const factor = Math.exp(-e.deltaY * ZOOM_SENSITIVITY)
-      const target = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoomTargetRef.current * factor))
-      zoomTargetRef.current = target
+      zoomTargetRef.current = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoomTargetRef.current * factor))
     }
-
     el.addEventListener("wheel", onWheel, { passive: false } as any)
     return () => el.removeEventListener("wheel", onWheel as any)
   }, [])
 
-  // ——— click: visor tamaño real
+  // Click → visor
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
@@ -754,7 +895,7 @@ export default function PixiGrid() {
     return () => el.removeEventListener("click", onClick)
   }, [])
 
-  // ——— drop: coloca imagen (máx 1024, sin upscale)
+  // Drop file
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
@@ -763,7 +904,6 @@ export default function PixiGrid() {
       e.preventDefault()
       const file = e.dataTransfer?.files?.[0]
       if (!file) return
-
       const rect = el.getBoundingClientRect()
       const localX = e.clientX - rect.left
       const localY = e.clientY - rect.top
@@ -772,7 +912,6 @@ export default function PixiGrid() {
       const c = Math.floor((localX + ox) / size)
       const r = Math.floor((localY + oy) / size)
       const key = `${r}:${c}`
-
       const canvas = await pixelateFile(file, { maxWidth: 1024, noUpscale: true })
       setCell(key, canvas)
       draw()
@@ -785,39 +924,27 @@ export default function PixiGrid() {
     }
   }, [])
 
-  // ——— acción: volar a (0,0)
+  // Fly a (0,0)
   const flyHome = () => {
     const app = appRef.current
     const el = containerRef.current
     if (!app || !el) return
-
-    // corto inercia
     inertiaActiveRef.current = false
     velRef.current = { x: 0, y: 0 }
-
-    const w = el.clientWidth
-    const h = Math.max(320, el.clientHeight)
+    const w = el.clientWidth, h = Math.max(320, el.clientHeight)
     const size = cellPxRef.current * zoomRef.current
-
     const targetX = 0.5 * size - w / 2
     const targetY = 0.5 * size - h / 2
-
-    flyRef.current = {
-      active: true,
-      t: 0,
-      start: { x: originRef.current.x, y: originRef.current.y },
-      target: { x: targetX, y: targetY },
-    }
-
+    flyRef.current = { active: true, t: 0, start: { x: originRef.current.x, y: originRef.current.y }, target: { x: targetX, y: targetY } }
     hoverKeyRef.current = "0:0"
     hoverGrowTRef.current = 0
     hoverGlowTRef.current = 1
     setHoverCoord({ x: 0, y: 0 })
-    hoverLockRef.current = "0:0" // bloqueo hover hasta que muevas el mouse
+    hoverLockRef.current = "0:0"
     draw()
   }
 
-  // ——— Pre carga imagen inicial
+  // Preload
   useEffect(() => {
     let cancelled = false
     ;(async () => {
@@ -842,18 +969,13 @@ export default function PixiGrid() {
         ref={containerRef}
         data-grid-root
         className="relative w-full h-full overflow-hidden select-none"
-        style={{ cursor }}   // nativo: "default" | "grab" | "grabbing" | "pointer"
+        style={{ cursor }}
       >
-        {/* overlay coordenadas (independiente) */}
-        <div
-          className="absolute left-2 top-2 z-[200] px-2 py-1 rounded-md text-xs text-white bg-black/60 backdrop-blur-sm pointer-events-none"
-          style={{ lineHeight: 1.1 }}
-        >
+        <div className="absolute left-2 top-2 z-[200] px-2 py-1 rounded-md text-xs text-white bg-black/60 backdrop-blur-sm pointer-events-none" style={{ lineHeight: 1.1 }}>
           <span className="opacity-70 mr-1">Zona</span>
           <span>({hoverCoord.x}, {hoverCoord.y})</span>
         </div>
 
-        {/* botón centro (ícono) */}
         <button
           data-ui-overlay
           onClick={(e) => { e.stopPropagation(); flyHome() }}
@@ -862,7 +984,7 @@ export default function PixiGrid() {
           onWheel={(e) => { e.stopPropagation(); e.preventDefault() }}
           aria-label="Volver a (0,0)"
           title="Volver a (0,0)"
-          style={{ cursor: "pointer" }}   // mano nativa del browser
+          style={{ cursor: "pointer" }}
           className={[
             "absolute left-2 top-12 z-[200] w-9 h-9 rounded-full",
             "flex items-center justify-center",
@@ -878,16 +1000,8 @@ export default function PixiGrid() {
       </div>
 
       {viewerUrl && (
-        <div
-          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
-          onClick={() => setViewerUrl(null)}
-        >
-          <img
-            src={viewerUrl}
-            alt="preview"
-            style={{ imageRendering: "pixelated" }}
-            className="max-w-[90vw] max-h-[90vh]"
-          />
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={() => setViewerUrl(null)}>
+          <img src={viewerUrl} alt="preview" style={{ imageRendering: "pixelated" }} className="max-w-[90vw] max-h-[90vh]" />
         </div>
       )}
     </>
